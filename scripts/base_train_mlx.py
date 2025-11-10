@@ -112,8 +112,8 @@ class AttentionGradSafe(nn.Module):
         )
 
         # Precompute angles for all positions [0, 1, 2, ..., max_seq_len-1]
-        positions = mx.arange(0.0, max_seq_len, dtype=mx.float32)  # (max_seq,)
-        angles = positions[:, None] * freqs[None, :]  # (max_seq, half_D)
+        positions = mx.arange(0.0, max_seq_len, dtype=mx.float32)
+        angles = positions[:, None] * freqs[None, :]
 
         # Precompute cos/sin lookup tables
         # Shape: (1, 1, max_seq_len, half_D) for broadcasting with (B, H, L, half_D)
@@ -125,15 +125,7 @@ class AttentionGradSafe(nn.Module):
         self._rope_sin = mx.stop_gradient(self._rope_sin)
 
     def _apply_rope_fast(self, x, offset):
-        """Apply RoPE using precomputed cos/sin lookup tables.
-
-        Args:
-            x: Input tensor (B, H, L, D)
-            offset: Position offset for sequence (int)
-
-        Returns:
-            Rotated tensor (B, H, L, D)
-        """
+        """Apply RoPE using precomputed cos/sin lookup tables."""
         B, H, L, D = x.shape
         half_D = D // 2
 
@@ -144,12 +136,12 @@ class AttentionGradSafe(nn.Module):
             offset = int(offset)
 
         # Slice precomputed cos/sin tables (no trig computation!)
-        cos_vals = self._rope_cos[:, :, offset:offset+L, :]  # (1, 1, L, half_D)
-        sin_vals = self._rope_sin[:, :, offset:offset+L, :]  # (1, 1, L, half_D)
+        cos_vals = self._rope_cos[:, :, offset:offset+L, :]
+        sin_vals = self._rope_sin[:, :, offset:offset+L, :]
 
         # Split x into two halves
-        x1 = x[..., :half_D]  # (B, H, L, half_D)
-        x2 = x[..., half_D:]  # (B, H, L, half_D)
+        x1 = x[..., :half_D]
+        x2 = x[..., half_D:]
 
         # Apply rotation: [x1*cos - x2*sin, x1*sin + x2*cos]
         rotated_x1 = x1 * cos_vals - x2 * sin_vals
@@ -161,13 +153,13 @@ class AttentionGradSafe(nn.Module):
     def __call__(self, x, mask=None, cache=None):
         from mlx_lm.models.base import scaled_dot_product_attention
         from mlx_lm.models.nanochat import rms_norm
-        
+
         B, L, _ = x.shape
-        
+
         queries = self.c_q(x)
         keys = self.c_k(x)
         values = self.c_v(x)
-        
+
         # Reshape to (B, L, H, D) then transpose to (B, H, L, D)
         queries = queries.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -386,7 +378,7 @@ def create_grad_safe_model(args):
             # Add batch and head dimensions: (1, 1, max_seq, max_seq)
             self._causal_mask = causal_mask[None, None, :, :]
             self._causal_mask = mx.stop_gradient(self._causal_mask)
-        
+
         def __call__(self, inputs, cache=None):
             h = self.wte(inputs)
             h = rms_norm(h)
