@@ -23,7 +23,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
@@ -60,6 +60,9 @@ core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
+# Resume training
+resume_from_checkpoint = "" # path to checkpoint directory to resume from (e.g. "base_checkpoints/d4") or empty to start fresh
+resume_step = -1 # step number to resume from (-1 = use latest checkpoint)
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -76,6 +79,8 @@ get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else l
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
+if master_process:
+    print0(f"wandb run name: '{run}' (use_dummy_wandb={use_dummy_wandb})")
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
@@ -104,13 +109,42 @@ print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tok
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 # -----------------------------------------------------------------------------
-# Initialize the Model
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+# Initialize the Model (or load from checkpoint)
+base_dir = get_base_dir()
+start_step = 0
+optimizer_data = None
+meta_data = None
+if resume_from_checkpoint:
+    # Load model from checkpoint
+    checkpoint_dir = os.path.join(base_dir, resume_from_checkpoint)
+    if resume_step == -1:
+        resume_step = find_last_step(checkpoint_dir)
+    print0(f"Resuming from checkpoint: {checkpoint_dir} at step {resume_step}")
+    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_step, device, load_optimizer=True)
+    # Use config from checkpoint
+    model_config_kwargs = meta_data["model_config"]
+    # Extract depth and model_tag from checkpoint for later use
+    checkpoint_depth = model_config_kwargs.get('n_layer', 4)
+    checkpoint_model_tag = meta_data.get('user_config', {}).get('model_tag', '')
+    start_step = resume_step + 1
+    print0(f"Resuming training from step {start_step}")
+else:
+    # Initialize new model
+    model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+    checkpoint_depth = depth
+    # model_tag is defined in the config section above, safe to use here
+    checkpoint_model_tag = model_tag
+
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
 model.to_empty(device=device)
-model.init_weights()
+if resume_from_checkpoint:
+    # Load model state
+    model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    model.load_state_dict(model_data, strict=True, assign=True)
+else:
+    model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
 model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
 num_params = sum(p.numel() for p in model.parameters())
@@ -142,9 +176,13 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
 optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
 adamw_optimizer, muon_optimizer = optimizers
+if resume_from_checkpoint and optimizer_data:
+    # Load optimizer state
+    adamw_optimizer.load_state_dict(optimizer_data[0])
+    muon_optimizer.load_state_dict(optimizer_data[1])
+    print0("Loaded optimizer state from checkpoint")
 
 # Initialize the DataLoaders for train/val
-base_dir = get_base_dir()
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 train_loader = tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="train", device=device)
 build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
@@ -177,8 +215,9 @@ min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
+smooth_step_time = 0 # EMA of step time for time estimation
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -218,7 +257,8 @@ for step in range(num_iterations + 1):
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if master_process and (last_step or (step > 0 and step % sample_every == 0)):
+    # Always sample at last_step, even if sample_every=-1
+    if master_process and (last_step or (sample_every > 0 and step > 0 and step % sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -239,7 +279,8 @@ for step in range(num_iterations + 1):
 
     # save checkpoint at the end of the run (only on master process)
     if master_process and last_step:
-        output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+        # Use checkpoint_depth and checkpoint_model_tag set earlier
+        output_dirname = checkpoint_model_tag if checkpoint_model_tag else f"d{checkpoint_depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
@@ -302,8 +343,37 @@ for step in range(num_iterations + 1):
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
+        # Update EMA of step time for time estimation (only after warmup)
+        smooth_step_time = ema_beta * smooth_step_time + (1 - ema_beta) * dt
+    # Calculate estimated time remaining
+    steps_remaining = num_iterations - step
+    if step > 10 and smooth_step_time > 0:
+        estimated_time_remaining = steps_remaining * smooth_step_time
+        if estimated_time_remaining < 60:
+            time_remaining_str = f"{estimated_time_remaining:.1f}s"
+        elif estimated_time_remaining < 3600:
+            time_remaining_str = f"{estimated_time_remaining/60:.1f}m"
+        else:
+            hours = int(estimated_time_remaining // 3600)
+            minutes = int((estimated_time_remaining % 3600) // 60)
+            time_remaining_str = f"{hours}h{minutes}m"
+    else:
+        time_remaining_str = "N/A"
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m | ETA: {time_remaining_str}")
+
+    # Optional memory logging (PyTorch MPS memory stats)
+    MEMLOG_EVERY = 10  # Log every N steps (0 = disabled)
+    if MEMLOG_EVERY > 0 and step % MEMLOG_EVERY == 0:
+        if device_type == "mps":
+            allocated_gb = torch.mps.current_allocated_memory() / (1024**3)
+            driver_gb = torch.mps.driver_allocated_memory() / (1024**3)
+            print0(f"[mem] allocated={allocated_gb:.2f}GB driver={driver_gb:.2f}GB")
+        elif device_type == "cuda":
+            allocated_gb = torch.cuda.memory_allocated() / (1024**3)
+            reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+            print0(f"[mem] allocated={allocated_gb:.2f}GB reserved={reserved_gb:.2f}GB")
+
     if step % 100 == 0:
         log_data = {
             "step": step,

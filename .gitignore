@@ -5,3 +5,7 @@ rustbpe/target/
 dev-ignore/
 report.md
 eval_bundle/
+.DS_Store
+wandb/
+uv.lock
+uv.lock

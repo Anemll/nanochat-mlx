@@ -20,10 +20,23 @@ mkdir -p $NANOCHAT_BASE_DIR
 
 # install uv (if not already installed)
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+# ensure uv is in PATH (needed if it was just installed)
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 # create a .venv local virtual environment (if it doesn't exist)
 [ -d ".venv" ] || uv venv
+# Detect OS and set appropriate dependencies
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS - use CPU/MPS
+    EXTRA_DEPS="cpu"
+    USE_TORCHRUN=false
+else
+    # Linux - use GPU
+    EXTRA_DEPS="gpu"
+    USE_TORCHRUN=true
+fi
+
 # install the repo dependencies
-uv sync --extra gpu
+uv sync --extra $EXTRA_DEPS
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
 
@@ -82,15 +95,53 @@ python -m scripts.tok_eval
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
-# Number of processes/GPUs to use
+# Number of processes/GPUs to use (only used on Linux)
 NPROC_PER_NODE=8
 
+# Helper function to run commands with or without torchrun
+run_cmd() {
+    local module="$1"
+    shift
+    if [ "$USE_TORCHRUN" = true ]; then
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m "$module" "$@"
+    else
+        # macOS: run directly without torchrun
+        python -m "$module" "$@"
+    fi
+}
+
 # pretrain the d20 model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+if [ "$USE_TORCHRUN" = true ]; then
+    # Linux GPU configuration (8XH100):
+    # - depth=20 (~561M parameters)
+    # - Uses Chinchilla scaling: tokens = 20 × params (~11.2B tokens)
+    # - device_batch_size=32 (default)
+    # - max_seq_len=2048 (default)
+    # - Auto-calculates iterations based on target_param_data_ratio=20
+    run_cmd scripts.base_train -- --depth=20 --run=$WANDB_RUN
+else
+    # macOS configuration (CPU/MPS):
+    # - depth=4 (~37M parameters) - much smaller for testing
+    # - max_seq_len=1024 (reduced from 2048)
+    # - device_batch_size=1 (reduced from 32)
+    # - total_batch_size=1024 (reduced from 524,288)
+    # - num_iterations=50 (fixed, instead of auto-calculated)
+    # - eval_tokens=4096 (reduced from default)
+    # - core_metric_every=50 (more frequent evaluation)
+    # 
+    # Example manual run (equivalent to what this script does):
+    # WANDB_RUN=macos-d4-test python -m scripts.base_train \
+    #   --depth=4 --max_seq_len=1024 --device_batch_size=1 \
+    #   --eval_tokens=4096 --core_metric_every=50 \
+    #   --total_batch_size=1024 --num_iterations=50 \
+    #   --run=macos-d4-test
+    echo "Running on macOS - using smaller model configuration"
+    python -m scripts.base_train --depth=4 --max_seq_len=1024 --device_batch_size=1 --eval_tokens=4096 --core_metric_every=50 --total_batch_size=1024 --num_iterations=50 --run=$WANDB_RUN
+fi
 # evaluate the model on a larger chunk of train/val data and draw some samples
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
+run_cmd scripts.base_loss --device_batch_size=1
 # evaluate the model on CORE tasks
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+run_cmd scripts.base_eval --max-per-task=16
 
 # -----------------------------------------------------------------------------
 # Midtraining (teach the model conversation special tokens, tool use, multiple choice)
@@ -100,15 +151,27 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run midtraining and eval the model
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
+if [ "$USE_TORCHRUN" = true ]; then
+    run_cmd scripts.mid_train -- --run=$WANDB_RUN
+    run_cmd scripts.chat_eval -- -i mid
+else
+    # macOS: use smaller configuration
+    python -m scripts.mid_train --max_seq_len=1024 --device_batch_size=1 --eval_tokens=4096 --total_batch_size=1024 --num_iterations=100 --run=$WANDB_RUN
+    python -m scripts.chat_eval --source=mid --max-new-tokens=128 --max-problems=20
+fi
 
 # -----------------------------------------------------------------------------
 # Supervised Finetuning (domain adaptation to each sequence all by itself per row)
 
 # train sft and re-eval right away (should see a small bump)
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+if [ "$USE_TORCHRUN" = true ]; then
+    run_cmd scripts.chat_sft -- --run=$WANDB_RUN
+    run_cmd scripts.chat_eval -- -i sft
+else
+    # macOS: use smaller configuration
+    python -m scripts.chat_sft --device_batch_size=1 --target_examples_per_step=4 --num_iterations=100 --eval_steps=4 --eval_metrics_max_problems=16 --run=$WANDB_RUN
+    python -m scripts.chat_eval --source=sft --max-new-tokens=128 --max-problems=20
+fi
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"

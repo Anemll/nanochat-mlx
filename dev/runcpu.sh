@@ -13,6 +13,8 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+# ensure uv is in PATH (needed if it was just installed)
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 [ -d ".venv" ] || uv venv
 uv sync --extra cpu
 source .venv/bin/activate

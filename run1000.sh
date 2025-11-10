@@ -9,8 +9,25 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+# ensure uv is in PATH (needed if it was just installed)
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 [ -d ".venv" ] || uv venv
-uv sync --extra gpu
+
+# Detect OS and set appropriate dependencies
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS - use CPU/MPS
+    EXTRA_DEPS="cpu"
+    USE_TORCHRUN=false
+    echo "WARNING: This script is designed for 8XH100 GPU clusters (~$1000, 41.6 hours)."
+    echo "Running on macOS will use a much smaller model and take significantly longer."
+    echo "This is for testing/learning purposes only."
+else
+    # Linux - use GPU
+    EXTRA_DEPS="gpu"
+    USE_TORCHRUN=true
+fi
+
+uv sync --extra $EXTRA_DEPS
 source .venv/bin/activate
 if [ -z "$WANDB_RUN" ]; then
     WANDB_RUN=dummy
@@ -22,12 +39,31 @@ uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # train tokenizer on ~4B characters and kick off download of the rest for pretraining
-python -m nanochat.dataset -n 16
-# start downloading the rest of the shards for a total of 800 (see below why 800)
-python -m nanochat.dataset -n 800 &
+if [ "$USE_TORCHRUN" = true ]; then
+    python -m nanochat.dataset -n 16
+    # start downloading the rest of the shards for a total of 800 (see below why 800)
+    python -m nanochat.dataset -n 800 &
+    DATASET_DOWNLOAD_PID=$!
+else
+    # macOS: use much smaller dataset
+    echo "macOS: Using smaller dataset (16 shards instead of 800)"
+    python -m nanochat.dataset -n 16
+    DATASET_DOWNLOAD_PID=""
+fi
 # todo: download the rest of it
-python -m scripts.tok_train --max_chars=4000000000
+if [ "$USE_TORCHRUN" = true ]; then
+    python -m scripts.tok_train --max_chars=4000000000
+else
+    # macOS: use smaller tokenizer training
+    python -m scripts.tok_train --max_chars=1000000000
+fi
 python -m scripts.tok_eval
+
+# Wait for dataset download to complete (if it was started)
+if [ -n "$DATASET_DOWNLOAD_PID" ]; then
+    echo "Waiting for dataset download to complete..."
+    wait $DATASET_DOWNLOAD_PID
+fi
 
 # Documenting my process for determining the hyperparameters for this run1000.sh script:
 # We want a budget of approx. $1000 ~= 41.6 hours of 8XH100 compute
@@ -71,21 +107,53 @@ python -m scripts.tok_eval
 # start to overfit hard.
 # 5) That's it, everything else (e.g. the learning rates) is adjusted automatically by the training script.
 
-# Number of processes/GPUs to use
+# Helper function to run commands with or without torchrun
+run_cmd() {
+    local module="$1"
+    shift
+    if [ "$USE_TORCHRUN" = true ]; then
+        torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m "$module" "$@"
+    else
+        # macOS: run directly without torchrun
+        python -m "$module" "$@"
+    fi
+}
+
+# Number of processes/GPUs to use (only used on Linux)
 NPROC_PER_NODE=8
 
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=32 --device_batch_size=8 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+# Base training
+if [ "$USE_TORCHRUN" = true ]; then
+    # Full $1000 tier: depth=32, ~1.9B parameters, 71,680 steps
+    run_cmd scripts.base_train -- --depth=32 --device_batch_size=8 --run=$WANDB_RUN
+else
+    # macOS: use much smaller model for testing
+    echo "macOS: Using smaller model (depth=4 instead of depth=32)"
+    python -m scripts.base_train --depth=4 --max_seq_len=1024 --device_batch_size=1 --eval_tokens=4096 --core_metric_every=50 --total_batch_size=1024 --num_iterations=50 --run=$WANDB_RUN
+fi
+run_cmd scripts.base_loss --device_batch_size=1
+run_cmd scripts.base_eval --max-per-task=16
 
 # midtrain
 # NOTE: ensure that we use the same device_batch_size here as the base training script.
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --device_batch_size=8 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
+if [ "$USE_TORCHRUN" = true ]; then
+    run_cmd scripts.mid_train -- --device_batch_size=8 --run=$WANDB_RUN
+    run_cmd scripts.chat_eval -- -i mid
+else
+    # macOS: use smaller configuration
+    python -m scripts.mid_train --max_seq_len=1024 --device_batch_size=1 --eval_tokens=4096 --total_batch_size=1024 --num_iterations=100 --run=$WANDB_RUN
+    python -m scripts.chat_eval --source=mid --max-new-tokens=128 --max-problems=20
+fi
 
 # sft
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+if [ "$USE_TORCHRUN" = true ]; then
+    run_cmd scripts.chat_sft -- --run=$WANDB_RUN
+    run_cmd scripts.chat_eval -- -i sft
+else
+    # macOS: use smaller configuration
+    python -m scripts.chat_sft --device_batch_size=1 --target_examples_per_step=4 --num_iterations=100 --eval_steps=4 --eval_metrics_max_problems=16 --run=$WANDB_RUN
+    python -m scripts.chat_eval --source=sft --max-new-tokens=128 --max-problems=20
+fi
 
 # generate final report
 python -m nanochat.report generate

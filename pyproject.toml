@@ -66,6 +66,11 @@ cpu = [
 ]  
 gpu = [  
     "torch>=2.8.0",  
+]
+mlx = [
+    "mlx>=0.20.0",
+    "mlx-lm>=0.5.0",
+    "mlx-optimizers>=0.1.0",
 ]  
   
 [tool.uv]  
