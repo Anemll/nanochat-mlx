@@ -22,7 +22,14 @@ import numpy as np
 try:
     from mlx_lm.models.nanochat import Model as MLXNanoChatModel, ModelArgs as MLXModelArgs
     from mlx_lm.models.nanochat import Attention as MLXAttention
-    from mlx_optimizers import Muon
+    # Use MLX's native Muon optimizer (uses mx.addmm fusion like PyTorch!)
+    try:
+        from mlx.optimizers import Muon
+        print("Using MLX native Muon (with mx.addmm fusion)")
+    except ImportError:
+        # Fallback to mlx-optimizers package if native not available
+        from mlx_optimizers import Muon
+        print("Using Muon from mlx_optimizers package")
 except ImportError:
     raise ImportError("Please install MLX dependencies: uv sync --extra mlx (or pip install mlx mlx-lm mlx-optimizers)")
 
@@ -277,6 +284,8 @@ unembedding_lr = 0.004  # learning rate for lm_head
 matrix_lr = 0.02  # learning rate for matrix parameters (Muon - not yet implemented)
 weight_decay = 0.0  # weight decay
 grad_clip = 1.0  # gradient clipping (0.0 = disabled)
+use_adamw_only = False  # Set to True to use AdamW for all params (no Muon) for speed testing
+muon_backend_steps = 5  # Newton-Schulz iterations (5=default, try 3 or 2 for speed)
 warmup_ratio = 0.0  # LR warmup ratio
 warmdown_ratio = 0.2  # LR warmdown ratio
 final_lr_frac = 0.0  # final LR fraction
@@ -289,9 +298,34 @@ model_tag = ""  # model tag for checkpoint
 resume_from_checkpoint = ""  # checkpoint path
 resume_step = -1  # step to resume from
 
-# Apply configurator overrides
+# Apply CLI overrides (replaces the deleted configurator.py)
+# Supports: --key=value for any config variable defined above
+import sys
+from ast import literal_eval
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open(os.path.join('nanochat', 'configurator.py')).read())
+for arg in sys.argv[1:]:
+    if '=' not in arg:
+        assert not arg.startswith('--')
+        config_file = arg
+        print0(f"Overriding config with {config_file}:")
+        with open(config_file) as f:
+            print0(f.read())
+        exec(open(config_file).read())
+    else:
+        assert arg.startswith('--')
+        key, val = arg.split('=', 1)
+        key = key[2:]
+        if key in globals():
+            try:
+                attempt = literal_eval(val)
+            except (SyntaxError, ValueError):
+                attempt = val
+            if globals()[key] is not None:
+                assert type(attempt) == type(globals()[key]), f"Type mismatch for {key}: {type(attempt)} != {type(globals()[key])}"
+            print0(f"Overriding: {key} = {attempt}")
+            globals()[key] = attempt
+        else:
+            raise ValueError(f"Unknown config key: {key}")
 user_config = {k: globals()[k] for k in config_keys}
 
 # -----------------------------------------------------------------------------
@@ -319,7 +353,7 @@ print0(f"num_kv_heads: {num_kv_heads}")
 
 # Gradient accumulation
 tokens_per_fwdbwd = device_batch_size * max_seq_len
-grad_accum_steps = total_batch_size // tokens_per_fwdbwd
+grad_accum_steps = max(1, total_batch_size // tokens_per_fwdbwd)  # Ensure at least 1 step
 print0(f"Tokens / micro-batch: {tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
@@ -603,27 +637,15 @@ def compute_loss(model, inputs, targets):
     logits = model(inputs)
     # Note: softcap is already applied in the model forward pass (GradSafeModel.__call__)
     # So we don't apply it again here
-    
+
     # Flatten for cross-entropy
     B, T, V = logits.shape
     logits_flat = logits.reshape(-1, V)
     targets_flat = targets.reshape(-1).astype(mx.int32)
-    
-    # Manual cross-entropy: log_softmax + gather + negate
-    # Use numerically stable log_softmax: log_softmax(x) = x - log(sum(exp(x)))
-    # Subtract max for numerical stability
-    max_logits = mx.max(logits_flat, axis=-1, keepdims=True)
-    exp_logits = mx.exp(logits_flat - max_logits)
-    log_probs = (logits_flat - max_logits) - mx.log(mx.sum(exp_logits, axis=-1, keepdims=True))
-    
-    # Gather log probs for target tokens using indexing
-    batch_size = log_probs.shape[0]
-    batch_indices = mx.arange(batch_size)
-    target_log_probs = log_probs[batch_indices, targets_flat]
-    
-    # Mean loss (negative log likelihood)
-    loss = -mx.mean(target_log_probs)
-    
+
+    # Use MLX built-in cross_entropy (numerically stable, better fused)
+    loss = mx.mean(nn.losses.cross_entropy(logits_flat, targets_flat))
+
     return loss
 
 # Create compiled loss and gradient function using MLX's module-aware gradient transform
@@ -758,14 +780,27 @@ adamw_lm_head = optim.AdamW(
     weight_decay=weight_decay
 )
 
-# Muon for matrix parameters (attention and MLP weights)
-muon_optimizer = Muon(
-    learning_rate=matrix_lr,
-    momentum=0.95,
-    nesterov=True,
-    backend='newtonschulz5',
-    backend_steps=5
-)
+# Matrix optimizer: Muon or AdamW (for speed testing)
+if use_adamw_only:
+    print0("Using AdamW for all parameters (including matrix params) - NO MUON")
+    matrix_optimizer = optim.AdamW(
+        learning_rate=matrix_lr,
+        betas=(0.8, 0.95),
+        eps=1e-10,
+        weight_decay=weight_decay
+    )
+    matrix_optimizer_name = "AdamW"
+else:
+    print0(f"Using Muon for matrix parameters (ns_steps={muon_backend_steps})")
+    # Use MLX native Muon with Newton-Schulz orthogonalization
+    matrix_optimizer = Muon(
+        learning_rate=matrix_lr,
+        momentum=0.95,
+        weight_decay=0.0,  # We handle weight decay separately
+        nesterov=True,
+        ns_steps=muon_backend_steps  # Newton-Schulz iterations
+    )
+    matrix_optimizer_name = "Muon"
 
 # Store initial learning rates for scheduling
 initial_lrs = {
@@ -778,7 +813,7 @@ initial_lrs = {
 param_groups = [
     {"name": "embedding", "optimizer": adamw_embedding, "param_names": embedding_param_names, "initial_lr": adamw_embedding_lr},
     {"name": "lm_head", "optimizer": adamw_lm_head, "param_names": lm_head_param_names, "initial_lr": adamw_lm_head_lr},
-    {"name": "matrix", "optimizer": muon_optimizer, "param_names": matrix_param_names, "initial_lr": matrix_lr},
+    {"name": "matrix", "optimizer": matrix_optimizer, "param_names": matrix_param_names, "initial_lr": matrix_lr},
 ]
 
 # -----------------------------------------------------------------------------
@@ -1198,14 +1233,14 @@ for step in range(start_step, num_iterations + 1):
         initial_params = None
         print0("DEBUG: Freed parameter snapshot")
     
-    # Get next batch for next iteration
-    x, y = next(train_loader)
-    
     t1 = time.time()
     dt = t1 - t0
+
+    # Prefetch next batch (after timing, overlaps with logging)
+    x, y = next(train_loader)
     
     # Logging
-    train_loss = accumulated_loss / grad_accum_steps
+    train_loss = accumulated_loss / max(1, grad_accum_steps)  # Safety check: avoid division by zero
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
     pct_done = 100 * step / num_iterations

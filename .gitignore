@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.pyo
 dev-ignore/
 report.md
 eval_bundle/
@@ -13,3 +14,28 @@ eval_bundle/
 CLAUDE.md
 wandb/
 uv.lock
+
+# Claude Code
+.claude/
+
+# Compiled / build artifacts
+*.so
+*.dylib
+*.o
+*.a
+*.whl
+*.egg
+*.egg-info/
+build/
+dist/
+target/
+rustbpe/target/
+.eggs/
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temp files
+mlx_issue_reply.md
