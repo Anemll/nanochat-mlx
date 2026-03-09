@@ -1,11 +1,15 @@
 .venv/
 __pycache__/
 *.pyc
-rustbpe/target/
 dev-ignore/
 report.md
 eval_bundle/
 .DS_Store
+
+# Secrets
+.env
+
+# Local setup
+CLAUDE.md
 wandb/
-uv.lock
 uv.lock
